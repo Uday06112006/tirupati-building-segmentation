@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  ortho-generator-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ortho-generator/orthophoto-api:1.0.0
+    container_name: ortho_generator_api
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - ORTHO_APP_NAME=OrthoGenerator 2D Orthomosaic Microservice
+      - ORTHO_DEFAULT_GSD_METERS=0.05
+      - ORTHO_DEFAULT_BLENDING=multiband
+      - ORTHO_MAX_CONCURRENT_JOBS=2
+    volumes:
+      - ./outputs:/app/outputs
+      - ../api_video_ortho/outputs:/data/video_outputs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

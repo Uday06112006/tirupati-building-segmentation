@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  video-ortho-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ortho-generator/video-to-frame:1.0.0
+    container_name: ortho_video_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ORTHO_APP_NAME=OrthoGenerator Video-to-Frame Microservice
+      - ORTHO_DEFAULT_JPEG_QUALITY=100
+      - ORTHO_DEFAULT_FRAME_STEP=1
+      - ORTHO_MAX_CONCURRENT_JOBS=4
+    volumes:
+      - ./outputs:/app/outputs
+      # Optional: Mount your host video dataset directory into container
+      - ../F7:/data/F7:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s

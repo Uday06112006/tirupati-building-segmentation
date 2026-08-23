@@ -1,0 +1,77 @@
+# ==========================================
+# Drone Orthophoto & 3D Photogrammetry Suite
+# Git Ignore Configuration
+# ==========================================
+
+# Exclude Raw Drone Video/SRT Data (User Specified)
+F7/
+*.MOV
+*.mov
+*.MP4
+*.mp4
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+*/.venv/
+*/venv/
+*/env/
+
+# Python Bytecode & Cache
+__pycache__/
+*/__pycache__/
+*/**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Testing & Coverage
+.pytest_cache/
+*/.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Generated Outputs, Caches & Processing Artifacts
+outputs/
+*/outputs/
+*/**/outputs/
+_sfm_temp/
+*/_sfm_temp/
+_sfm_cache/
+*/_sfm_cache/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Geotagged Frames, GeoTIFFs, Point Clouds, Meshes & ZIPs in output directories
+*.tif
+*.tiff
+*.ply
+*.obj
+*.gltf
+*.glb
+*.las
+*.laz
+*.zip
+*.geojson
+
+# Logs & Runtime Dumps
+*.log
+logs/
+*/logs/
+nohup.out
+
+# IDEs & OS Specific Files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
