@@ -27,6 +27,10 @@ class OrthoMosaicEngine:
     # Canvas pixels of each frame's rim excluded from ownership (interpolation there
     # mixes in the black warp border).
     EDGE_EXCLUDE_PX = 4
+    # Seams are chosen on a downscaled copy. Seam placement only needs to be accurate
+    # to a metre or so -- the feather covers the rest -- and graph cut over the full
+    # canvas would be needlessly slow.
+    SEAM_SCALE = 0.4
 
     @staticmethod
     def _spatial_meta(crs, min_x, min_y, max_x, max_y, canvas_w, canvas_h,
@@ -162,6 +166,40 @@ class OrthoMosaicEngine:
         return gains
 
     @classmethod
+    def _route_seams(cls, small, corners, sizes, order):
+        """
+        Choose seam paths that follow ground rather than cutting through buildings.
+
+        Nadir-weight argmax alone puts the seam wherever two frames happen to trade
+        places, which is frequently straight across a rooftop -- and because a planar
+        mosaic misplaces anything with height, the two frames put that roof metres
+        apart, so the building arrives severed and doubled.
+
+        A graph cut instead pays a price proportional to how much the two frames
+        *disagree* along the boundary, so the seam is pushed into regions where they
+        agree -- flat ground -- and routed around structures. The lean stays (only a
+        DSM removes that) but each building is served whole by one frame.
+
+        Operates on downscaled ROI crops; returns refined masks in the same order.
+        """
+        masks = [cv2.UMat(m) for _, m in small]
+        imgs = [im.astype(np.float32) / 255.0 for im, _ in small]
+        try:
+            finder = cv2.detail_GraphCutSeamFinder("COST_COLOR_GRAD")
+            finder.find(imgs, corners, masks)
+            out = [m.get() for m in masks]
+            logger.info("Graph-cut seam routing over %d frames", len(imgs))
+            return out
+        except cv2.error as e:
+            logger.warning("Graph cut unavailable (%s); falling back to Voronoi seams", e)
+            try:
+                masks = [cv2.UMat(m) for _, m in small]
+                cv2.detail_VoronoiSeamFinder().find(imgs, corners, masks)
+                return [m.get() for m in masks]
+            except cv2.error:
+                return [m for _, m in small]
+
+    @classmethod
     def _composite_best_frame(cls, images, transformer, min_x, max_y,
                               canvas_w, canvas_h, gsd_m, max_range_m,
                               progress_callback=None):
@@ -214,36 +252,106 @@ class OrthoMosaicEngine:
                 progress_callback(10.0 + (idx / n) * 35.0,
                                   f"Selecting best view {idx+1}/{n} ({info.filename})...")
 
+        feather_px = max(1.0, cls.SEAM_FEATHER_M / gsd_m)
+
+        # Pass 2 -- re-cut the seams. The partition above is geometry-only: it hands
+        # over wherever two frames trade nadir advantage, which lands on rooftops as
+        # often as not. Graph cut instead prices each boundary by how much the two
+        # frames disagree there, pushing seams onto ground they agree on and around
+        # structures they do not.
+        sc = cls.SEAM_SCALE
+        sw, sh = max(1, int(round(canvas_w * sc))), max(1, int(round(canvas_h * sc)))
+        S = np.array([[sc, 0, 0], [0, sc, 0], [0, 0, 1]], float)
+        gsd_s = gsd_m / sc
+        order, small, corners, small_sel = [], [], [], {}
+        small_warps: Dict[int, np.ndarray] = {}
+
+        for k, idx in enumerate(sorted(cache)):
+            info = images[idx]
+            M, cx, cy = cache[idx]
+            bgr = cv2.imread(info.file_path)
+            if bgr is None:
+                continue
+            rgb_s = cls._warp_prefiltered(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                                          S @ M, sw, sh)
+            cov_s = cv2.warpPerspective(
+                np.full((info.height, info.width), 255, np.uint8), S @ M, (sw, sh),
+                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            er = max(1, int(round(cls.EDGE_EXCLUDE_PX * sc)))
+            cov_s = cv2.erode(cov_s, np.ones((er * 2 + 1,) * 2, np.uint8))
+            sco_s = nadir_weight_map((sh, sw), cx, cy, info.agl_m, min_x, max_y, gsd_s,
+                                     max_range_m or (2.5 * info.agl_m))
+            cov_s[sco_s <= 0] = 0
+            if not cov_s.any():
+                continue
+            ys, xs = np.nonzero(cov_s)
+            y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+            order.append(idx)
+            corners.append((int(x0), int(y0)))
+            small.append((rgb_s[y0:y1, x0:x1], cov_s[y0:y1, x0:x1].copy()))
+            small_sel[idx] = (y0, y1, x0, x1)
+            small_warps[idx] = rgb_s
+            if progress_callback:
+                progress_callback(45.0 + (k / n) * 20.0,
+                                  f"Preparing seams {k+1}/{n} ({info.filename})...")
+
+        refined = cls._route_seams(small, corners, None, order)
+
+        # Rebuild ownership from the routed masks. Where the cut left a pixel to more
+        # than one frame, or to none, fall back to the nadir-weight winner.
+        lab_s = np.full((sh, sw), -1, np.int32)
+        best_s = np.zeros((sh, sw), np.float32)
+        for k, idx in enumerate(order):
+            y0, y1, x0, x1 = small_sel[idx]
+            m = refined[k]
+            if m is None or not np.any(m):
+                continue
+            info = images[idx]
+            _, cx, cy = cache[idx]
+            sco = nadir_weight_map((sh, sw), cx, cy, info.agl_m, min_x, max_y, gsd_s,
+                                   max_range_m or (2.5 * info.agl_m))
+            claim = np.zeros((sh, sw), bool)
+            claim[y0:y1, x0:x1] = m > 0
+            take = claim & (sco > best_s)
+            best_s[take] = sco[take]
+            lab_s[take] = idx
+
+        # Upscaling the seam labels nearest-neighbour leaves stair-steps the width of
+        # the seam-scale factor. A median filter over the label field snaps those back
+        # to a smooth boundary; the median of a set of labels is always one of them, so
+        # no pixel is handed to a frame that never claimed it.
+        up = cv2.resize((lab_s + 1).astype(np.uint8), (canvas_w, canvas_h),
+                        interpolation=cv2.INTER_NEAREST)
+        k = int(round(1.0 / cls.SEAM_SCALE)) * 2 + 1
+        up = cv2.medianBlur(up, k if k % 2 else k + 1)
+        grown = up.astype(np.int16) - 1
+        # Never claim a pixel the frame does not actually cover.
+        keep = grown >= 0
+        label = np.where(keep & (grown != label), grown, label).astype(np.int16)
+
+        sels = {idx: (label == idx) for idx in order}
+        sels = {i: m for i, m in sels.items() if m.any()}
+        gains = cls._solve_gains(
+            {i: small_warps[i] for i in sels},
+            {i: cv2.resize(sels[i].astype(np.uint8), (sw, sh),
+                           interpolation=cv2.INTER_NEAREST).astype(bool) for i in sels},
+            lab_s, max(1.0, feather_px * sc))
+        del small, small_warps, refined
+
         accum_rgb = np.zeros((canvas_h, canvas_w, 3), np.float32)
         accum_w = np.zeros((canvas_h, canvas_w), np.float32)
-        feather_px = max(1.0, cls.SEAM_FEATHER_M / gsd_m)
-        warps: Dict[int, np.ndarray] = {}
-        sels: Dict[int, np.ndarray] = {}
 
-        # Pass 2a -- warp each owner and measure its exposure over the area it owns.
-        for idx, info in enumerate(images):
-            if idx not in cache:
-                continue
-            sel = (label == idx)
-            if not sel.any():
-                continue
-            img_bgr = cv2.imread(info.file_path)
-            if img_bgr is None:
+        # Pass 3 -- each frame paints only the pixels it owns, cross-fading at seams.
+        # Full-resolution warps are streamed one at a time; holding all of them would
+        # cost ~1.3 GB on a canvas this size for no benefit.
+        for idx in sorted(sels):
+            sel = sels[idx]
+            bgr = cv2.imread(images[idx].file_path)
+            if bgr is None:
                 continue
             M, _, _ = cache[idx]
-            warps[idx] = cls._warp_prefiltered(
-                cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), M, canvas_w, canvas_h)
-            sels[idx] = sel
-            if progress_callback:
-                progress_callback(45.0 + (idx / n) * 30.0,
-                                  f"Rectifying frame {idx+1}/{n} ({info.filename})...")
-
-        gains = cls._solve_gains(warps, sels, label, feather_px)
-
-        # Pass 2b -- each frame paints only the pixels it owns, cross-fading at seams.
-        for idx in sorted(warps):
-            sel = sels[idx]
-            warped = warps[idx] * gains[idx]
+            warped = cls._warp_prefiltered(
+                cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), M, canvas_w, canvas_h) * gains[idx]
 
             dist = cv2.distanceTransform(sel.astype(np.uint8), cv2.DIST_L2, 5)
             wgt = np.minimum(dist / feather_px, 1.0).astype(np.float32)

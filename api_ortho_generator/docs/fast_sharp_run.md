@@ -94,11 +94,12 @@ These are computed at runtime, not supplied. Recorded because they determine the
 | Median AGL | 55.2 m | XMP `RelativeAltitude` |
 | Focal length in pixels | 2987 px @ 3840 wide | 28 mm equiv, 36 mm sensor convention |
 | Nadir-equivalent GSD | 1.89 cm/px | AGL ÷ focal px |
-| **Usable range factor** | **1.48 × height = 82 m** | `usable_range_factor()`, §4 |
+| **Usable range factor** | **1.48 × height = 82 m** | `usable_range_factor()`, §5 |
 | Canvas | 3105 × 5079 px | extent ÷ GSD |
 | Mapped area | 2.41 ha (61.5 % of canvas) | alpha band |
-| Exposure gain spread | 1.488 over 34 seam pairs | `_solve_gains()` |
-| Runtime | 92 s | 28 frames, two passes |
+| Exposure gain spread | 1.488 over 41 seam pairs | `_solve_gains()` |
+| Seam routing | graph cut, 28 frames | `_route_seams()`, §4a |
+| Runtime | 123 s | 28 frames, three passes |
 
 ### Engine constants
 
@@ -107,11 +108,35 @@ Defined on `OrthoMosaicEngine`; change these to trade sharpness against seam vis
 | Constant | Value | Effect |
 | --- | --- | --- |
 | `SEAM_FEATHER_M` | `0.6` m | Cross-fade width at ownership seams. Wider hides seams but re-introduces averaging blur on anything with height. |
+| `SEAM_SCALE` | `0.4` | Resolution at which seams are routed by graph cut. Labels are median-filtered on upscale, otherwise the boundary shows stair-steps `1/SEAM_SCALE` px wide. |
 | `EDGE_EXCLUDE_PX` | `4` px | Rim of each frame barred from owning pixels; without it, interpolation against the black warp border draws a dark line along every seam. |
 | `_solve_gains(clamp=…)` | `(0.82, 1.22)` | Bound on per-frame exposure gain. Both ends were reached on this clip — auto-exposure moved 1/640 → 1/500 mid-flight. |
 | `NEIGHBOURS` | `2` | Frames compared for exposure, in capture order. Only nearby frames share a seam on a single transect. |
 
-## 4. Why the derived cutoff is 1.48×
+## 4. Seam routing
+
+Nadir-weight argmax alone decides ownership on geometry only, so it hands over wherever
+two frames trade nadir advantage — frequently straight across a rooftop. Because a planar
+mosaic misplaces anything with height, the two frames put that roof metres apart, and the
+building arrives severed and doubled.
+
+Measured directly: after **perfect** flat-plane rectification, two adjacent frames still
+place the same scene content up to **6.03 m (120 px) apart**, median 1.66 m. That is
+parallax from real 3D structure, not a registration error.
+
+`cv2.detail_GraphCutSeamFinder("COST_COLOR_GRAD")` re-cuts the boundaries, pricing each
+one by how much the two frames disagree along it. Seams are pushed onto ground the frames
+agree on and routed around structures, so each building is served whole by a single frame.
+Falls back to Voronoi seams, then to the raw argmax partition, if the cut fails.
+
+This does **not** remove lean — see §6. It removes the *slicing*.
+
+> No 2D stitching library can do better here. OpenCV `Stitcher`, Hugin and similar fit one
+> 2D transform per image, valid for rotation-only or planar scenes. With a translating
+> camera over 3D structure there is no single transform that maps ground and rooftop
+> correctly at once — that is what parallax means.
+
+## 5. Why the derived cutoff is 1.48×
 
 Looking out at incidence angle θ, ground range is `H·tan θ` and along-range sample
 spacing stretches as `(H/f)·sin θ / cos² θ`. Setting that equal to the target GSD gives the
@@ -126,13 +151,14 @@ range = H · tan θ           →  1.48 × height = 82 m
 So the cutoff follows the requested GSD. Ask for a finer GSD and the usable range shrinks
 (sharper, less coverage); ask for coarser and it grows.
 
-## 5. Known limits of this output
+## 6. Known limits of this output
 
 - **Not a true orthophoto.** Every pixel is projected onto one flat plane at median flying
   height. Anything with height is displaced by `h·tan θ` — 89 px for a single-storey roof,
   306 px for a mature palm, at 5 cm/px. Best-frame selection makes buildings lean *crisply*
-  instead of dissolving, but the lean is real. Removing it needs a DSM, i.e. the `accurate`
-  engine.
+  instead of dissolving, and graph-cut seams stop them being sliced, but **the lean is
+  still there**. Removing it needs a DSM, i.e. the `accurate` engine. Buildings will not
+  sit square over their footprints until then.
 - **Faint radiometric banding at seams** — lens vignetting. One scalar gain per frame
   cannot flatten a falloff that varies across the frame.
 - **Coverage is a fan, not a strip**, because a −38° forward-looking camera images ahead of
@@ -141,7 +167,7 @@ So the cutoff follows the requested GSD. Ask for a finer GSD and the usable rang
 - Pitch carries roughly **±2° systematic uncertainty** from focal-length coupling
   (≈ 1° of pitch per 1 mm of assumed 35 mm-equivalent focal length).
 
-## 6. Output files
+## 7. Output files
 
 | File | Contents |
 | --- | --- |
