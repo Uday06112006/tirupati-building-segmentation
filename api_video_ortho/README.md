@@ -35,6 +35,7 @@ flowchart TD
 
 - **Lossless / Maximum Quality Frame Extraction**: Extracts uncompressed RGB frames preserving full native resolution (e.g. 4K UHD $3840 \times 2160$ or 8K) and saves using maximum quality JPEG (`quality=100`, 4:4:4 chroma subsampling) or PNG.
 - **Robust Multi-Vendor SRT Parser**: Handles DJI drone telemetry subtitles (including standard format, bracketed tags `[latitude : 13.398...]`, ISO, shutter speeds `1/640.0`, focal length, aperture f-number, EV, color temperature, and gimbal orientation `yaw`, `pitch`, `roll`).
+- **Attitude Recovery for Position-Only Telemetry**: Many DJI SRT tracks carry *no* `gb_yaw` / `gb_pitch` / `gb_roll`. `app/services/attitude_estimator.py` recovers exterior orientation anyway — see [Attitude Recovery](#-attitude-recovery) below.
 - **Standard EXIF & GPS Metadata Injection**: Embeds standard rational DMS coordinates (`GPSLatitude`, `GPSLongitude`, `GPSAltitude`, `GPSTimeStamp`, `GPSDateStamp`), camera parameters (`ISOSpeedRatings`, `FNumber`, `ExposureTime`, `FocalLength`, `DateTimeOriginal`), and full telemetry JSON payload into `UserComment`.
 - **RFC 7946 GeoJSON Generation**: Automatically produces a standard GeoJSON `FeatureCollection` with:
   - 📍 `Point` features for every extracted frame (with full properties: coordinates, timestamp, camera settings, image filename).
@@ -281,6 +282,82 @@ python client_demo.py --video D:/ortho_generator/F7/DJI_0527.MOV --srt D:/ortho_
 # Trigger via Microservice API
 python client_demo.py --api --api-url http://localhost:8000 --interval 2.0
 ```
+
+---
+
+## 🧭 Attitude Recovery
+
+Many DJI SRT tracks carry position and exposure only — no `gb_yaw` / `gb_pitch` / `gb_roll`.
+`DJI_0527.SRT` is one of them: 661 records, every attitude field absent. Attitude is still
+recoverable from the video itself.
+
+```bash
+python tools/derive_attitude.py \
+  --video D:/ortho_generator/F7/DJI_0527.MOV \
+  --srt   D:/ortho_generator/F7/DJI_0527.SRT \
+  --out   outputs/DJI_0527_attitude.csv \
+  --report outputs/DJI_0527_attitude_report.json
+```
+
+Two independent estimators feed the output:
+
+| Source | Yields | Notes |
+| ------ | ------ | ----- |
+| **GPS track** (`compute_track_dynamics`) | `estimated_yaw` (course over ground), `ground_speed`, `heading_change`, `vertical_speed` | SRT lat/lon are quantised to 6 dp (~0.11 m) and ~61 % of consecutive frame pairs show *zero* motion, so naive `atan2(ΔE, ΔN)` differences quantisation noise (≈25° scatter). A windowed linear fit over ±8 frames gives **0.64°** scatter in cruise. |
+| **Ground-plane homography** (`estimate_visual_attitude`) | `camera_yaw`, `camera_pitch`, `camera_roll`, `agl_m` | Decomposing the inter-frame homography gives `(R, t/d, n)`; the normal `n` *is* gravity in camera axes → true pitch/roll. Pairing `t` with the GPS bearing fixes yaw. The `|t|` scale factor recovers height above ground. |
+
+Course over ground is where the **aircraft goes**; the homography solution is where the
+**camera looks**. They are not the same — on this clip they differ by a steady −6.9°.
+
+Frames outside the solved span are marked `visual-extrapolated` in `attitude_source`
+rather than being passed off as measurements. Degenerate solves (near-zero baseline while
+the aircraft accelerates or hovers) are rejected by MAD before interpolation.
+
+### Extracting geotagged frames with orientation
+
+One command does the whole job — extract at a fixed cadence, geotag, and package:
+
+```bash
+python tools/extract_geotagged.py \
+  --video D:/ortho_generator/F7/DJI_0527.MOV \
+  --srt   D:/ortho_generator/F7/DJI_0527.SRT \
+  --interval 1.0 \
+  --out   outputs/DJI_0527_1fps
+```
+
+`--interval 1.0` gives 1 frame per second (28 frames from this 27.6 s clip). Attitude is
+read from `outputs/<stem>_attitude.csv` if it exists, otherwise derived on the spot;
+`--no-attitude` skips orientation entirely.
+
+Each frame is written at full native resolution (3840×2160, JPEG q100, 4:4:4) carrying:
+
+| Where | Fields |
+| ----- | ------ |
+| **EXIF** | `GPSLatitude/Longitude/Altitude` (WGS-84 DMS rational), `GPSImgDirection` (true north), `GPSTimeStamp`, `DateTimeOriginal`, `ISO`, `FNumber`, `ExposureTime`, `FocalLengthIn35mmFilm`, full telemetry JSON in `UserComment` |
+| **XMP** | `drone-dji:GimbalYaw/Pitch/RollDegree`, `drone-dji:AbsoluteAltitude` (MSL), `drone-dji:RelativeAltitude` (AGL), `drone-dji:FlightYawDegree` (course over ground), `drone-dji:GpsLatitude/Longitude`, plus `Camera:Yaw/Pitch/Roll` |
+| **GeoJSON** | `Point` per frame with `yaw`/`pitch`/`roll` in properties, plus the `LineString` trajectory |
+
+EXIF has nowhere to put gimbal pitch or roll — it only carries a compass direction — so
+orientation goes in **XMP**, which is what WebODM, Pix4D and Metashape actually read.
+`attitude_source` is recorded in both `UserComment` and the XMP packet, so derived
+orientation stays distinguishable from telemetry-reported orientation.
+
+> `drone-dji:FlightRollDegree` / `FlightPitchDegree` are deliberately **never** written.
+> A gimbal decouples camera attitude from airframe attitude; we measure the camera, so
+> claiming to know the airframe would be fabrication.
+
+### Verifying the camera intrinsics
+
+`--verify-focal` scores candidate focal lengths against scene geometry. For a given `f`
+the homography predicts exactly where the *vertical* vanishing point must fall; straight
+edges in the image are independent evidence, so the best-supported `f` wins. This is a
+genuine constraint, unlike requiring `t·n ≈ 0`, which the decomposition satisfies almost
+automatically regardless of `f`.
+
+> ⚠️ Absolute pitch is coupled to focal length (≈ +1° of pitch per −1 mm of assumed
+> 35 mm-equivalent focal length). Roll, yaw and AGL are far less sensitive. For
+> survey-grade exterior orientation, treat these values as **initialisation for bundle
+> adjustment**, not as a substitute for it.
 
 ---
 

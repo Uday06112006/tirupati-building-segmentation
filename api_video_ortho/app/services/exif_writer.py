@@ -201,15 +201,23 @@ class EXIFWriter:
         image_pil: Image.Image,
         output_path: str,
         exif_bytes: bytes,
-        quality: int = 100
+        quality: int = 100,
+        xmp_bytes: Optional[bytes] = None
     ) -> str:
-        """Save a PIL Image as high-quality JPEG with embedded EXIF metadata."""
-        # Save image with exif
-        image_pil.save(
-            output_path,
+        """
+        Save a PIL Image as high-quality JPEG with embedded EXIF metadata.
+
+        ``xmp_bytes`` adds an APP1 XMP segment alongside EXIF. Gimbal pitch and roll
+        have no standard EXIF representation, so photogrammetry engines read camera
+        orientation from XMP -- see :mod:`app.services.xmp_writer`.
+        """
+        save_kwargs = dict(
             format="JPEG",
             quality=quality,
             subsampling=0,  # 4:4:4 chroma subsampling for best quality
-            exif=exif_bytes
+            exif=exif_bytes,
         )
+        if xmp_bytes:
+            save_kwargs["xmp"] = xmp_bytes
+        image_pil.save(output_path, **save_kwargs)
         return output_path

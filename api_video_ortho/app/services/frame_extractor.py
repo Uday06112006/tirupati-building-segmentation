@@ -7,6 +7,8 @@ from PIL import Image
 
 from .srt_parser import SRTTelemetryParser, TelemetryRecord
 from .exif_writer import EXIFWriter
+from .xmp_writer import build_xmp
+from .attitude_estimator import AttitudeTrack
 from ..models.schemas import FrameMetadata, ExtractionRequest
 
 logger = logging.getLogger(__name__)
@@ -99,10 +101,14 @@ class FrameExtractor:
         srt_parser: SRTTelemetryParser,
         output_dir: str,
         params: ExtractionRequest,
-        progress_callback: Optional[Callable[[float, str], None]] = None
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+        attitude: Optional[AttitudeTrack] = None
     ) -> List[FrameMetadata]:
         """
         Extract video frames, match with SRT telemetry, inject EXIF metadata, and save to output_dir.
+
+        ``attitude`` supplies camera orientation for SRT tracks that carry none. Values
+        found in the SRT always win; the derived track only fills genuine gaps.
         """
         os.makedirs(output_dir, exist_ok=True)
         video_info = cls.get_video_info(video_path)
@@ -164,6 +170,23 @@ class FrameExtractor:
                     pitch = telemetry.pitch if telemetry else None
                     roll = telemetry.roll if telemetry else None
 
+                    # Fill missing orientation from the derived attitude track.
+                    att = attitude.get(save_frame_num) if attitude else None
+                    attitude_source = None
+                    agl = None
+                    course = None
+                    if att is not None:
+                        agl = att.agl_m
+                        course = att.estimated_yaw
+                        if att.camera_pitch is not None:
+                            if yaw is None:
+                                yaw = att.camera_yaw
+                            if pitch is None:
+                                pitch = att.camera_pitch
+                            if roll is None:
+                                roll = att.camera_roll
+                            attitude_source = att.attitude_source
+
                     # Generate EXIF bytes
                     exif_bytes = EXIFWriter.create_exif_bytes(
                         latitude=lat,
@@ -182,16 +205,36 @@ class FrameExtractor:
                             "diff_time_ms": telemetry.diff_time_ms if telemetry else None,
                             "ev": telemetry.ev if telemetry else None,
                             "ct": telemetry.ct if telemetry else None,
-                            "color_md": telemetry.color_md if telemetry else None
+                            "color_md": telemetry.color_md if telemetry else None,
+                            "attitude_source": attitude_source,
+                            "agl_m": agl,
+                            "course_over_ground": course
                         }
                     )
+
+                    # Gimbal pitch/roll have no EXIF home; photogrammetry engines read
+                    # them from XMP, so emit that alongside.
+                    xmp_bytes = None
+                    if pitch is not None or roll is not None or yaw is not None:
+                        xmp_bytes = build_xmp(
+                            gimbal_yaw=yaw,
+                            gimbal_pitch=pitch,
+                            gimbal_roll=roll,
+                            absolute_altitude=alt,
+                            relative_altitude=agl,
+                            latitude=lat,
+                            longitude=lon,
+                            flight_yaw=course,
+                            attitude_source=attitude_source,
+                        )
 
                     # Save tagged image
                     EXIFWriter.save_image_with_exif(
                         image_pil=pil_img,
                         output_path=image_save_path,
                         exif_bytes=exif_bytes,
-                        quality=params.jpeg_quality
+                        quality=params.jpeg_quality,
+                        xmp_bytes=xmp_bytes
                     )
 
                     # Record metadata

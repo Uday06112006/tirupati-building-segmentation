@@ -9,6 +9,7 @@ from pathlib import Path
 from .srt_parser import SRTTelemetryParser
 from .frame_extractor import FrameExtractor
 from .geojson_builder import GeoJSONBuilder
+from .attitude_estimator import AttitudeTrack
 from ..models.schemas import ExtractionRequest, FrameMetadata
 
 logger = logging.getLogger(__name__)
@@ -26,10 +27,14 @@ class OrthoPipeline:
         srt_path: str,
         output_dir: str,
         params: ExtractionRequest,
-        progress_callback: Optional[Callable[[float, str], None]] = None
+        progress_callback: Optional[Callable[[float, str], None]] = None,
+        attitude: Optional["AttitudeTrack"] = None
     ) -> Dict[str, Any]:
         """
         Execute the complete processing pipeline.
+
+        ``attitude`` optionally supplies derived camera orientation for SRT tracks
+        with no yaw/pitch/roll fields; see :mod:`app.services.attitude_estimator`.
         """
         start_time = datetime.now(timezone.utc)
         if progress_callback:
@@ -63,7 +68,8 @@ class OrthoPipeline:
             srt_parser=parser,
             output_dir=frames_dir,
             params=params,
-            progress_callback=internal_progress
+            progress_callback=internal_progress,
+            attitude=attitude
         )
 
         # 4. Generate GeoJSON

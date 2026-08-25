@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from dataclasses import dataclass
@@ -7,6 +8,10 @@ from PIL import Image
 import piexif
 
 logger = logging.getLogger(__name__)
+
+# drone-dji / Camera XMP attributes, e.g. drone-dji:GimbalPitchDegree="-37.61"
+_XMP_ATTR_RE = re.compile(r'(?:drone-dji|Camera):(\w+)\s*=\s*"([^"]*)"')
+
 
 @dataclass
 class ImageGeoInfo:
@@ -25,6 +30,17 @@ class ImageGeoInfo:
     roll_deg: float = 0.0
     timestamp_str: Optional[str] = None
     extra_meta: Optional[Dict[str, Any]] = None
+    # Height above ground, which is what orthorectification needs. EXIF GPSAltitude is
+    # usually MSL, so it is NOT interchangeable with this.
+    agl_m: Optional[float] = None
+    # 35 mm-equivalent focal length. DJI reports focal length this way, so pairing it
+    # with a physical sensor width would understate the field of view badly.
+    focal_35mm: Optional[float] = None
+    pose_is_known: bool = False
+
+    @property
+    def is_nadir(self) -> bool:
+        return abs(self.pitch_deg + 90.0) < 5.0
 
 class EXIFReader:
     """
@@ -58,9 +74,17 @@ class EXIFReader:
             with Image.open(image_path) as img:
                 width, height = img.size
                 exif_bytes = img.info.get("exif")
-                
+                xmp_raw = img.info.get("xmp")
+
             if not exif_bytes:
                 return None
+
+            # Gimbal pitch/roll have no EXIF representation; they live in XMP.
+            xmp_tags: Dict[str, str] = {}
+            if xmp_raw:
+                if isinstance(xmp_raw, bytes):
+                    xmp_raw = xmp_raw.decode("utf-8", errors="ignore")
+                xmp_tags = dict(_XMP_ATTR_RE.findall(xmp_raw))
                 
             exif_data = piexif.load(exif_bytes)
             gps = exif_data.get("GPS", {})
@@ -93,6 +117,14 @@ class EXIFReader:
             if fl_rational and fl_rational[1] != 0:
                 focal_length_mm = float(fl_rational[0]) / float(fl_rational[1])
 
+            focal_35mm = None
+            fl35 = exif_ifd.get(piexif.ExifIFD.FocalLengthIn35mmFilm)
+            if fl35:
+                try:
+                    focal_35mm = float(fl35)
+                except (TypeError, ValueError):
+                    pass
+
             # 4. Parse Heading / Yaw
             yaw_deg = 0.0
             img_dir_rational = gps.get(piexif.GPSIFD.GPSImgDirection)
@@ -115,6 +147,34 @@ class EXIFReader:
             if isinstance(dt_orig, bytes):
                 dt_orig = dt_orig.decode("utf-8", errors="ignore")
 
+            # 6. Orientation and height above ground. XMP is authoritative because it
+            #    is where gimbal pitch/roll can be expressed at all; the UserComment
+            #    telemetry payload is the fallback.
+            def pick(*values):
+                for v in values:
+                    if v is None or v == "":
+                        continue
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        continue
+                return None
+
+            pitch_deg = pick(xmp_tags.get("GimbalPitchDegree"), xmp_tags.get("Pitch"),
+                             extra_meta.get("pitch"))
+            roll_deg = pick(xmp_tags.get("GimbalRollDegree"), xmp_tags.get("Roll"),
+                            extra_meta.get("roll"))
+            xmp_yaw = pick(xmp_tags.get("GimbalYawDegree"), xmp_tags.get("Yaw"))
+            if xmp_yaw is not None:
+                yaw_deg = xmp_yaw
+
+            agl_m = pick(xmp_tags.get("RelativeAltitude"), extra_meta.get("agl_m"))
+            abs_alt = pick(xmp_tags.get("AbsoluteAltitude"))
+            if abs_alt is not None:
+                altitude_m = abs_alt
+
+            pose_is_known = pitch_deg is not None and agl_m is not None and agl_m > 0
+
             return ImageGeoInfo(
                 file_path=image_path,
                 filename=os.path.basename(image_path),
@@ -125,8 +185,13 @@ class EXIFReader:
                 altitude_m=altitude_m,
                 focal_length_mm=focal_length_mm,
                 yaw_deg=yaw_deg,
+                pitch_deg=pitch_deg if pitch_deg is not None else -90.0,
+                roll_deg=roll_deg if roll_deg is not None else 0.0,
                 timestamp_str=dt_orig or None,
-                extra_meta=extra_meta
+                extra_meta=extra_meta,
+                agl_m=agl_m,
+                focal_35mm=focal_35mm,
+                pose_is_known=pose_is_known,
             )
         except Exception as e:
             logger.warning(f"Failed to read EXIF from {image_path}: {e}")
