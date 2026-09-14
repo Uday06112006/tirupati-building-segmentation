@@ -1,0 +1,16 @@
+{
+  "root_dir": ".",
+  "orthophoto_dir": "outputs",
+  "dataset_dir": "Dataset",
+  "annotation_dir": "Dataset/Annotations_final",
+  "mask_dir": "Dataset/masks_cleaned",
+  "patch_image_dir": "Dataset/patches/images",
+  "patch_mask_dir": "Dataset/patches/masks",
+  "checkpoint_dir": "segmentation_pipeline/checkpoints",
+  "log_dir": "segmentation_pipeline/logs",
+  "prediction_dir": "segmentation_pipeline/predictions",
+  "epochs": 40,
+  "batch_size": 2,
+  "patch_size": 512,
+  "learning_rate": 0.001
+}

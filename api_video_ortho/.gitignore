@@ -1,0 +1,37 @@
+# Large raster/video source data
+*.tif
+*.tiff
+*.MOV
+*.MP4
+*.mov
+*.mp4
+*.avi
+*.mkv
+*.SRT
+*.srt
+
+# Model artifacts
+*.pth
+*.ckpt
+
+# Generated segmentation dataset artifacts
+Dataset/Annotations/
+Dataset/Annotations_final/
+Dataset/Annotations_repaired/
+Dataset/masks_cleaned/
+Dataset/patches/
+Dataset/images/
+Dataset/qa_overlays_cleaned/
+Dataset/qa_overlays/
+Dataset/masks/
+Dataset/compare/
+Dataset/qa_geometry_repair/
+Dataset/segmentation_geojson_map.json
+
+# Generated orthophoto outputs
+outputs/
+
+# Segmentation generated artifacts
+segmentation_pipeline/checkpoints/
+segmentation_pipeline/logs/
+segmentation_pipeline/predictions/
