@@ -33,7 +33,7 @@ from rasterio.features import rasterize
 from shapely.affinity import affine_transform
 from shapely.geometry import shape
 from torch.cuda.amp import autocast, GradScaler
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 ROOT = Path(__file__).resolve().parents[1]
 DATASET_DIR = ROOT / 'Dataset'
@@ -201,7 +201,7 @@ class UNet(nn.Module):
         u1 = self.up1(d2)
         cat1 = torch.cat([u1, e1], dim=1)
         d1 = self.dec1(cat1)
-        return torch.sigmoid(self.out(d1))
+        return self.out(d1)
 
 
 def load_geojson(path: Path):
@@ -381,17 +381,25 @@ def valid_shape_mask(path: Path) -> bool:
         return False
 
 
-def bce_dice_loss(pred, target):
-    # target shape [N,1,H,W]
+def bce_dice_loss(logits, target):
+    # Keep BCE in logits space and calculate Dice from float32 probabilities.
     eps = 1e-6
-    bce = F.binary_cross_entropy(pred, target)
-    # dice on same arrangement
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
+    bce = F.binary_cross_entropy_with_logits(logits, target)
+    probs = torch.sigmoid(logits.float())
+    target = target.float()
+    pred_flat = probs.reshape(-1)
+    target_flat = target.reshape(-1)
     intersection = (pred_flat * target_flat).sum()
     denom = pred_flat.sum() + target_flat.sum() + eps
     dice = 1.0 - (2.0 * intersection + eps) / denom
     return bce + dice
+
+
+def ensure_finite(tensor, name, epoch, batch_index):
+    if not torch.isfinite(tensor).all():
+        raise RuntimeError(
+            f'Non-finite {name} detected at epoch {epoch}, batch {batch_index}.'
+        )
 
 
 def dice_iou_prec_rec(pred, target, eps=1e-6):
@@ -475,12 +483,15 @@ def run_sanity_check(device, batch_size=2, max_batches=2):
             # correct shape and predictions range.
             if pred.shape != yb_gpu.shape:
                 raise RuntimeError(f'Model output shape mismatch: pred={pred.shape}, yb={yb_gpu.shape}')
+            ensure_finite(pred, 'model output', 0, i)
+            pred_probs = torch.sigmoid(pred)
             # Finite loss
             loss = bce_dice_loss(pred.detach().cpu(), yb.detach().cpu())
+            ensure_finite(loss, 'loss', 0, i)
             if not torch.isfinite(loss):
                 ok['loss_finite'] = False
             # black/white check based on deterministic mask ratio
-            pflat = pred.detach().cpu().view(-1)
+            pflat = pred_probs.detach().cpu().view(-1)
             if (pflat.mean() <= 0.0) or (pflat.mean() >= 1.0):
                 ok['prediction_not_black_or_white'] = False
         if i >= max_batches - 1:
@@ -520,14 +531,17 @@ def validate_model(model, loader, device):
     total_iou, total_dice, total_prec, total_rec = 0.0, 0.0, 0.0, 0.0
     seen = 0
     with torch.no_grad():
-        for xb, yb in loader:
+        for batch_index, (xb, yb) in enumerate(loader):
             xb = xb.to(device)
             yb = yb.to(device)
             with autocast(enabled=torch.cuda.is_available()):
-                pred = model(xb)
-                loss = bce_dice_loss(pred, yb)
+                logits = model(xb)
+                ensure_finite(logits, 'model output', 0, batch_index)
+                loss = bce_dice_loss(logits, yb)
+            ensure_finite(loss, 'loss', 0, batch_index)
             total_loss += loss.item()
-            iou, dice, prec, rec = compute_metrics(pred.detach().cpu(), yb.detach().cpu())
+            probs = torch.sigmoid(logits.float())
+            iou, dice, prec, rec = compute_metrics(probs.detach().cpu(), yb.detach().cpu())
             total_iou += iou
             total_dice += dice
             total_prec += prec
@@ -586,7 +600,28 @@ def run_training(args):
     val_dataset = BinaryMaskDataset(val_img, val_masks)
     test_dataset = BinaryMaskDataset(test_img, test_masks)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    positive_flags = []
+    for mask_path in train_masks:
+        mask = np.asarray(Image.open(mask_path).convert('L'))
+        positive_flags.append(bool(np.any(mask > 0)))
+    positive_count = sum(positive_flags)
+    negative_count = len(positive_flags) - positive_count
+    if positive_count and negative_count:
+        positive_weight = negative_count / positive_count
+        sample_weights = [positive_weight if is_positive else 1.0 for is_positive in positive_flags]
+        train_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(train_dataset),
+            replacement=True,
+        )
+        print(
+            f'Training patch sampling: {positive_count} positive, {negative_count} negative; '
+            'weighted replacement sampling targets approximately 1:1.'
+        )
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
+    else:
+        print('Training patch sampling: weighted sampling disabled because one class is absent.')
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
@@ -642,13 +677,15 @@ def run_training(args):
         model.train()
         train_loss = 0.0
         # training batches
-        for xb, yb in train_loader:
+        for batch_index, (xb, yb) in enumerate(train_loader):
             xb = xb.to(device)
             yb = yb.to(device)
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=torch.cuda.is_available()):
-                preds = model(xb)
-                loss = bce_dice_loss(preds, yb)
+                logits = model(xb)
+                ensure_finite(logits, 'model output', epoch + 1, batch_index)
+                loss = bce_dice_loss(logits, yb)
+            ensure_finite(loss, 'loss', epoch + 1, batch_index)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -658,16 +695,19 @@ def run_training(args):
         val_loss = 0.0
         val_metrics = {'iou':0.0, 'dice':0.0, 'precision':0.0, 'recall':0.0}
         with torch.no_grad():
-            for xb, yb in val_loader:
+            for batch_index, (xb, yb) in enumerate(val_loader):
                 xb = xb.to(device)
                 yb = yb.to(device)
                 with autocast(enabled=torch.cuda.is_available()):
-                    preds = model(xb)
-                    loss = bce_dice_loss(preds, yb)
+                    logits = model(xb)
+                    ensure_finite(logits, 'model output', epoch + 1, batch_index)
+                    loss = bce_dice_loss(logits, yb)
+                ensure_finite(loss, 'loss', epoch + 1, batch_index)
                 val_loss += loss.detach().item()
                 # metric computation in batch and accumulate.
                 # convert CPU to compute where necessary
-                a, b, c, d = compute_metrics(preds.detach().cpu(), yb.detach().cpu())
+                probs = torch.sigmoid(logits.float())
+                a, b, c, d = compute_metrics(probs.detach().cpu(), yb.detach().cpu())
                 val_metrics['iou'] += a
                 val_metrics['dice'] += b
                 val_metrics['precision'] += c
