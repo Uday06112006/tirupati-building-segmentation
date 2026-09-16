@@ -46,6 +46,12 @@ CHECKPOINT_DIR = ROOT / 'segmentation_pipeline' / 'checkpoints'
 LOG_DIR = ROOT / 'segmentation_pipeline' / 'logs'
 PRED_DIR = ROOT / 'segmentation_pipeline' / 'predictions'
 
+# ImageNet normalization stats, required when using an ImageNet-pretrained
+# encoder (smp.Unet with encoder_weights='imagenet'). The scratch UNet keeps
+# using raw [0,1] inputs, matching its original training distribution.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 
 def load_config_file(path: str | None):
     """Load an optional JSON config file for the segmentation branch.
@@ -204,12 +210,45 @@ class UNet(nn.Module):
         return self.out(d1)
 
 
+def build_model(args):
+    """Build either the original scratch UNet or an ImageNet-pretrained
+    encoder U-Net (via segmentation-models-pytorch), based on args.
+
+    Both paths return a model whose forward(x) yields raw logits of shape
+    (N, 1, H, W), matching what bce_dice_loss / compute_metrics expect
+    everywhere else in this file. Nothing downstream of the model needs to
+    know which one is active.
+    """
+    if args.scratch_unet:
+        return UNet()
+
+    try:
+        import segmentation_models_pytorch as smp
+    except ImportError as exc:
+        raise ImportError(
+            'segmentation-models-pytorch is required for --encoder/pretrained '
+            'training. Install it with: pip install segmentation-models-pytorch '
+            '(or pass --scratch-unet to use the original from-scratch UNet).'
+        ) from exc
+
+    encoder_weights = None if args.encoder_weights.lower() == 'none' else args.encoder_weights
+    return smp.Unet(
+        encoder_name=args.encoder,
+        encoder_weights=encoder_weights,
+        in_channels=3,
+        classes=1,
+        activation=None,  # keep raw logits; loss/metrics apply sigmoid themselves
+    )
+
+
 def load_geojson(path: Path):
     with open(path, 'r', encoding='utf-8') as fp:
         return json.load(fp)
 
 
-def regenerate_final_masks_from_annotations(ann_dir=ANNOT_DIR, mask_dir=MASK_DIR):
+def regenerate_final_masks_from_annotations(ann_dir=None, mask_dir=None):
+    ann_dir = ann_dir or ANNOT_DIR
+    mask_dir = mask_dir or MASK_DIR
     """Regenerate a clean binary mask tree from Dataset/Annotations_final/.
 
     Writes masks under Dataset/masks_cleaned/ and matches the required orthophoto naming scheme.
@@ -381,24 +420,132 @@ def valid_shape_mask(path: Path) -> bool:
         return False
 
 
-def bce_dice_loss(logits, target):
-    # Keep BCE in logits space and calculate Dice from float32 probabilities.
-    eps = 1e-6
-    bce = F.binary_cross_entropy_with_logits(logits, target)
-    probs = torch.sigmoid(logits.float())
+def focal_loss_from_logits(logits, target, gamma=2.0):
+    """Compute focal loss from logits using stable BCE-with-logits values."""
+    logits = logits.float()
     target = target.float()
-    pred_flat = probs.reshape(-1)
-    target_flat = target.reshape(-1)
-    intersection = (pred_flat * target_flat).sum()
-    denom = pred_flat.sum() + target_flat.sum() + eps
-    dice = 1.0 - (2.0 * intersection + eps) / denom
-    return bce + dice
+    focal_bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+    pt = torch.exp(-focal_bce)
+    return ((1.0 - pt).pow(gamma) * focal_bce).mean()
+
+
+def bce_dice_loss(logits, target, pos_weight=None, return_components=False):
+    """Return a float32 BCE + per-image Dice loss, with focal kept separate."""
+    eps = 1e-6
+    logits = logits.float()
+    target = target.float()
+    bce = F.binary_cross_entropy_with_logits(
+        logits, target, pos_weight=pos_weight
+    )
+    probs = torch.sigmoid(logits)
+    reduce_dims = tuple(range(1, probs.ndim))
+    intersection = (probs * target).sum(dim=reduce_dims)
+    pred_sum = probs.sum(dim=reduce_dims)
+    target_sum = target.sum(dim=reduce_dims)
+    denominator = pred_sum + target_sum + eps
+    dice_score = (2.0 * intersection + eps) / denominator
+    dice_loss = (1.0 - dice_score).mean()
+    total = 0.5 * bce + 0.5 * dice_loss
+    if return_components:
+        return total, bce.detach(), dice_loss.detach()
+    return total
 
 
 def ensure_finite(tensor, name, epoch, batch_index):
     if not torch.isfinite(tensor).all():
         raise RuntimeError(
             f'Non-finite {name} detected at epoch {epoch}, batch {batch_index}.'
+        )
+
+
+def _print_nonfinite_gradient_report(name, gradient, epoch, batch_index, loss_info=None):
+    has_nan = torch.isnan(gradient).any().item()
+    has_inf = torch.isinf(gradient).any().item()
+    details = loss_info or {}
+    print(
+        'Non-finite gradient detected:\n'
+        f'  epoch: {epoch}\n'
+        f'  batch: {batch_index}\n'
+        f'  parameter: {name}\n'
+        f'  has_nan: {has_nan}\n'
+        f'  has_inf: {has_inf}\n'
+        f'  gradient_min: {gradient.min().item() if not has_nan and not has_inf else "unavailable"}\n'
+        f'  gradient_max: {gradient.max().item() if not has_nan and not has_inf else "unavailable"}\n'
+        f'  loss: {details.get("loss", "unavailable")}\n'
+        f'  bce: {details.get("bce", "unavailable")}\n'
+        f'  dice: {details.get("dice", "unavailable")}\n'
+        f'  logits_min: {details.get("logits_min", "unavailable")}\n'
+        f'  logits_max: {details.get("logits_max", "unavailable")}\n'
+        f'  prob_min: {details.get("prob_min", "unavailable")}\n'
+        f'  prob_max: {details.get("prob_max", "unavailable")}\n'
+        f'  target_min: {details.get("target_min", "unavailable")}\n'
+        f'  target_max: {details.get("target_max", "unavailable")}\n'
+        f'  target_positive_pixels: {details.get("target_positive_pixels", "unavailable")}\n'
+        f'  target_positive_fraction: {details.get("target_positive_fraction", "unavailable")}'
+    )
+
+
+def ensure_finite_gradients(model, epoch, batch_index, loss_info=None):
+    """Raise on any non-finite gradient. Use only when NOT using GradScaler
+    (i.e. the --no-amp / true fp32 path), where a non-finite gradient reflects
+    genuine numerical instability rather than an expected transient fp16
+    overflow that GradScaler is designed to detect and recover from on its own.
+    """
+    for name, parameter in model.named_parameters():
+        if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+            gradient = parameter.grad.detach().float()
+            _print_nonfinite_gradient_report(name, gradient, epoch, batch_index, loss_info)
+            raise RuntimeError(
+                f'Non-finite gradient detected for {name} at epoch {epoch}, batch {batch_index}.'
+            )
+
+
+def check_finite_gradients_amp(model, epoch, batch_index, loss_info=None):
+    """Non-raising gradient check for the AMP/GradScaler path.
+
+    A transient non-finite gradient after scaler.unscale_() is normal, expected
+    GradScaler behaviour (the loss-scale factor is occasionally too high; fp16
+    overflows during backward before unscaling). GradScaler.step()/update()
+    already detect this internally: they skip the optimizer step for this
+    batch and shrink the scale factor for future batches. This function only
+    reports what happened for visibility; it must NOT raise, or it turns a
+    self-correcting AMP event into a hard crash.
+
+    Returns True if all gradients are finite, False if an overflow was
+    detected (in which case the caller should skip gradient clipping and let
+    scaler.step()/scaler.update() handle the skip + scale backoff).
+    """
+    all_finite = True
+    for name, parameter in model.named_parameters():
+        if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+            all_finite = False
+            gradient = parameter.grad.detach().float()
+            _print_nonfinite_gradient_report(name, gradient, epoch, batch_index, loss_info)
+            break
+    return all_finite
+
+
+def ensure_finite_parameters(model, epoch, batch_index):
+    for name, parameter in model.named_parameters():
+        if not torch.isfinite(parameter).all():
+            raise RuntimeError(
+                f'Non-finite parameter detected for {name} at epoch {epoch}, batch {batch_index}.'
+            )
+
+
+def validate_batch(xb, yb, epoch, batch_index):
+    ensure_finite(xb, 'input batch', epoch, batch_index)
+    ensure_finite(yb, 'target batch', epoch, batch_index)
+    if xb.numel() and batch_index == 0:
+        print(f'First batch input range: {xb.min().item():.6f} to {xb.max().item():.6f}')
+    if yb.numel() and (yb.min().item() < 0.0 or yb.max().item() > 1.0):
+        raise RuntimeError(
+            f'Target values outside [0, 1] detected at epoch {epoch}, batch {batch_index}: '
+            f'min={yb.min().item()}, max={yb.max().item()}'
+        )
+    if yb.numel() and not torch.all((yb == 0.0) | (yb == 1.0)):
+        raise RuntimeError(
+            f'Target contains non-binary values at epoch {epoch}, batch {batch_index}.'
         )
 
 
@@ -421,9 +568,10 @@ def dice_iou_prec_rec(pred, target, eps=1e-6):
 
 
 class BinaryMaskDataset(Dataset):
-    def __init__(self, image_paths, mask_paths):
+    def __init__(self, image_paths, mask_paths, normalize_imagenet=False):
         self.image_paths = list(image_paths)
         self.mask_paths = list(mask_paths)
+        self.normalize_imagenet = normalize_imagenet
 
     def __len__(self):
         return len(self.image_paths)
@@ -434,6 +582,8 @@ class BinaryMaskDataset(Dataset):
         img = Image.open(img_path).convert('RGB')
         mask = Image.open(mask_path).convert('L')
         arr_img = np.array(img, dtype=np.float32) / 255.0
+        if self.normalize_imagenet:
+            arr_img = (arr_img - IMAGENET_MEAN) / IMAGENET_STD
         arr_mask = np.array(mask, dtype=np.float32) / 255.0
         arr_mask = (arr_mask > 0).astype(np.float32)
         img_t = torch.from_numpy(arr_img.transpose(2, 0, 1)).float()
@@ -441,7 +591,7 @@ class BinaryMaskDataset(Dataset):
         return img_t, mask_t
 
 
-def run_sanity_check(device, batch_size=2, max_batches=2):
+def run_sanity_check(args, device, batch_size=2, max_batches=2, amp_enabled=True):
     """Small sanity check for image load, mask match, patch tile dimensions, and model output shape."""
     train, val, test = collect_split_files()
     if not train:
@@ -449,10 +599,10 @@ def run_sanity_check(device, batch_size=2, max_batches=2):
     # sample only the first few pairs from train set.
     samples_img = train[:min(len(train), max_batches)]
     samples_mask = [PATCH_MASK_DIR / p.name for p in samples_img]
-    dataset = BinaryMaskDataset(samples_img, samples_mask)
+    dataset = BinaryMaskDataset(samples_img, samples_mask, normalize_imagenet=not args.scratch_unet)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
-    model = UNet().to(device)
+    model = build_model(args).to(device)
     model.eval()
     ok = {
         'images_load': True,
@@ -469,6 +619,7 @@ def run_sanity_check(device, batch_size=2, max_batches=2):
     for i, (xb, yb) in enumerate(loader):
         if xb.shape[0] == 0:
             continue
+        validate_batch(xb, yb, 0, i)
         if xb.shape[2:] != yb.shape[2:]:
             ok['dimensions_match'] = False
         # building pixels in sample mask
@@ -478,7 +629,7 @@ def run_sanity_check(device, batch_size=2, max_batches=2):
         with torch.no_grad():
             xb_gpu = xb.to(device)
             yb_gpu = yb.to(device)
-            with autocast(enabled=device.type == 'cuda'):
+            with autocast(enabled=amp_enabled and device.type == 'cuda'):
                 pred = model(xb_gpu)
             # correct shape and predictions range.
             if pred.shape != yb_gpu.shape:
@@ -510,8 +661,8 @@ def run_sanity_check(device, batch_size=2, max_batches=2):
     return ok, model
 
 
-def compute_metrics(pred, target, eps=1e-6):
-    pred_bin = (pred >= 0.5).float()
+def compute_metrics(pred, target, eps=1e-6, threshold=0.5):
+    pred_bin = (pred >= threshold).float()
     target_bin = (target >= 0.5).float()
     tp = torch.sum(pred_bin * target_bin)
     fp = torch.sum(pred_bin * (1 - target_bin))
@@ -525,35 +676,69 @@ def compute_metrics(pred, target, eps=1e-6):
     return float(iou.item()), float(dice.item()), float(prec.item()), float(rec.item())
 
 
-def validate_model(model, loader, device):
+def pixel_percentages(pred, target, threshold=0.5):
+    pred_pct = float((pred >= threshold).float().mean().item() * 100.0)
+    target_pct = float((target >= 0.5).float().mean().item() * 100.0)
+    return pred_pct, target_pct
+
+
+def validate_model(model, loader, device, pos_weight=None, amp_enabled=True):
     model.eval()
     total_loss = 0.0
     total_iou, total_dice, total_prec, total_rec = 0.0, 0.0, 0.0, 0.0
+    total_pred_pct, total_target_pct = 0.0, 0.0
+    threshold_values = (0.30, 0.40, 0.50, 0.60, 0.70)
+    threshold_ious = {threshold: 0.0 for threshold in threshold_values}
     seen = 0
     with torch.no_grad():
         for batch_index, (xb, yb) in enumerate(loader):
+            validate_batch(xb, yb, 0, batch_index)
             xb = xb.to(device)
             yb = yb.to(device)
-            with autocast(enabled=torch.cuda.is_available()):
+            with autocast(enabled=amp_enabled and device.type == 'cuda'):
                 logits = model(xb)
                 ensure_finite(logits, 'model output', 0, batch_index)
-                loss = bce_dice_loss(logits, yb)
+            loss, bce_component, dice_component = bce_dice_loss(
+                logits, yb, pos_weight, return_components=True
+            )
             ensure_finite(loss, 'loss', 0, batch_index)
+            ensure_finite(bce_component, 'BCE loss', 0, batch_index)
+            ensure_finite(dice_component, 'Dice loss', 0, batch_index)
             total_loss += loss.item()
             probs = torch.sigmoid(logits.float())
-            iou, dice, prec, rec = compute_metrics(probs.detach().cpu(), yb.detach().cpu())
+            probs_cpu = probs.detach().cpu()
+            target_cpu = yb.detach().cpu()
+            iou, dice, prec, rec = compute_metrics(probs_cpu, target_cpu)
+            pred_pct, target_pct = pixel_percentages(probs_cpu, target_cpu)
             total_iou += iou
             total_dice += dice
             total_prec += prec
             total_rec += rec
+            total_pred_pct += pred_pct
+            total_target_pct += target_pct
+            for threshold in threshold_values:
+                threshold_ious[threshold] += compute_metrics(
+                    probs_cpu, target_cpu, threshold=threshold
+                )[0]
             seen += 1
     n = max(1, seen)
+    threshold_results = {threshold: value / n for threshold, value in threshold_ious.items()}
+    print('Validation threshold sweep:')
+    for threshold, iou in threshold_results.items():
+        print(f'  {threshold:.2f} -> IoU {iou:.4f}')
+    print(
+        f'Predicted building pixels: {total_pred_pct / n:.2f}% | '
+        f'Actual building pixels: {total_target_pct / n:.2f}%'
+    )
     return {
         'loss': total_loss / n,
         'iou': total_iou / n,
         'dice': total_dice / n,
         'precision': total_prec / n,
         'recall': total_rec / n,
+        'predicted_building_pct': total_pred_pct / n,
+        'actual_building_pct': total_target_pct / n,
+        'threshold_iou': {f'{threshold:.2f}': value for threshold, value in threshold_results.items()},
     }
 
 
@@ -596,31 +781,58 @@ def run_training(args):
     val_masks = [PATCH_MASK_DIR / p.name for p in val_img]
     test_masks = [PATCH_MASK_DIR / p.name for p in test_img]
 
-    train_dataset = BinaryMaskDataset(train_img, train_masks)
-    val_dataset = BinaryMaskDataset(val_img, val_masks)
-    test_dataset = BinaryMaskDataset(test_img, test_masks)
+    train_dataset = BinaryMaskDataset(train_img, train_masks, normalize_imagenet=not args.scratch_unet)
+    val_dataset = BinaryMaskDataset(val_img, val_masks, normalize_imagenet=not args.scratch_unet)
+    test_dataset = BinaryMaskDataset(test_img, test_masks, normalize_imagenet=not args.scratch_unet)
 
-    positive_flags = []
+    building_fractions = []
+    positive_pixels = 0
+    negative_pixels = 0
     for mask_path in train_masks:
-        mask = np.asarray(Image.open(mask_path).convert('L'))
-        positive_flags.append(bool(np.any(mask > 0)))
-    positive_count = sum(positive_flags)
-    negative_count = len(positive_flags) - positive_count
-    if positive_count and negative_count:
-        positive_weight = negative_count / positive_count
-        sample_weights = [positive_weight if is_positive else 1.0 for is_positive in positive_flags]
+        with Image.open(mask_path) as mask_image:
+            mask = np.asarray(mask_image.convert('L'))
+        positive = int(np.count_nonzero(mask > 0))
+        total = int(mask.size)
+        positive_pixels += positive
+        negative_pixels += total - positive
+        building_fractions.append(positive / max(1, total))
+
+    empty_count = sum(fraction == 0.0 for fraction in building_fractions)
+    low_count = sum(0.0 < fraction <= 0.01 for fraction in building_fractions)
+    medium_count = sum(0.01 < fraction <= 0.10 for fraction in building_fractions)
+    high_count = sum(fraction > 0.10 for fraction in building_fractions)
+    sample_weights = []
+    for fraction in building_fractions:
+        if fraction == 0.0:
+            sample_weights.append(0.5)
+        elif fraction <= 0.01:
+            sample_weights.append(1.5)
+        elif fraction <= 0.10:
+            sample_weights.append(3.0)
+        else:
+            sample_weights.append(4.0)
+
+    if building_fractions:
         train_sampler = WeightedRandomSampler(
             weights=torch.as_tensor(sample_weights, dtype=torch.double),
             num_samples=len(train_dataset),
             replacement=True,
         )
         print(
-            f'Training patch sampling: {positive_count} positive, {negative_count} negative; '
-            'weighted replacement sampling targets approximately 1:1.'
+            'Training patch sampling:\n'
+            f'  total patches: {len(building_fractions)}\n'
+            f'  empty patches: {empty_count}\n'
+            f'  low-building patches (0-1%): {low_count}\n'
+            f'  medium-building patches (1-10%): {medium_count}\n'
+            f'  high-building patches (>10%): {high_count}\n'
+            f'  building fraction min/max/mean: {min(building_fractions):.6f}/'
+            f'{max(building_fractions):.6f}/{np.mean(building_fractions):.6f}\n'
+            '  sampling strategy: replacement with fraction-based weights '
+            '(empty=0.5, low=1.5, medium=3.0, high=4.0)'
         )
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler)
     else:
-        print('Training patch sampling: weighted sampling disabled because one class is absent.')
+        print('Training patch sampling: weighted sampling disabled because no patches were found.')
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
@@ -629,18 +841,38 @@ def run_training(args):
     split_patch_counts(train_img, val_img, test_img)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = UNet().to(device)
-    scaler = GradScaler(enabled=torch.cuda.is_available())
+    model = build_model(args).to(device)
+    if args.scratch_unet:
+        print('Model: scratch UNet (32/64/128/256 channels, no pretrained weights)')
+    else:
+        print(f'Model: smp.Unet(encoder_name={args.encoder!r}, encoder_weights={args.encoder_weights!r})')
+    amp_enabled = torch.cuda.is_available() and not args.no_amp
+    scaler = GradScaler() if amp_enabled else None
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    print(f'Learning rate: {args.lr:.6g}')
+    pixel_pos_weight = negative_pixels / max(1, positive_pixels)
+    pos_weight = min(5.0, max(1.0, pixel_pos_weight))
+    pos_weight = torch.tensor([pos_weight], dtype=torch.float32, device=device)
+    print(f'BCE positive pixel weight: {pos_weight.item():.4f} (raw ratio: {pixel_pos_weight:.4f})')
+
+    current_model_tag = 'scratch_unet' if args.scratch_unet else f'smp_unet_{args.encoder}'
 
     # Resume if requested.
     best_path = CHECKPOINT_DIR / 'building_segmentation_best.pth'
     latest_path = CHECKPOINT_DIR / 'building_segmentation_latest.pth'
     if args.resume and latest_path.exists():
         state = torch.load(latest_path, map_location=device)
+        saved_model_tag = state.get('model_type')
+        if saved_model_tag is not None and saved_model_tag != current_model_tag:
+            raise RuntimeError(
+                f'--resume checkpoint was trained with model_type={saved_model_tag!r} but '
+                f'this run is configured for model_type={current_model_tag!r}. Architectures '
+                'are not interchangeable (different layer names/shapes). Use a fresh '
+                '--checkpoint-dir for this architecture, or drop --resume.'
+            )
         model.load_state_dict(state['model'])
         optimizer.load_state_dict(state['optimizer'])
-        if 'scaler_state' in state:
+        if scaler is not None and 'scaler_state' in state:
             scaler.load_state_dict(state['scaler_state'])
         start_epoch = state.get('epoch', 0)
         best_iou = state.get('best_iou', -1)
@@ -661,7 +893,13 @@ def run_training(args):
     # Sanity check before full training.
     if args.sanity_check:
         print('Running a short sanity check...')
-        sanity_ok, _ = run_sanity_check(device, batch_size=1, max_batches=min(2, max(1, len(train_dataset))))
+        sanity_ok, _ = run_sanity_check(
+            args,
+            device,
+            batch_size=1,
+            max_batches=min(2, max(1, len(train_dataset))),
+            amp_enabled=amp_enabled,
+        )
         # CUDA availability is an environment signal, not a dataset/regression failure.
         pass_fail_ok = {k: v for k, v in sanity_ok.items() if k != 'cuda_used'}
         if not all(pass_fail_ok.values()):
@@ -672,57 +910,133 @@ def run_training(args):
             print('Sanity only requested; skipping full training run.')
             return
 
+    amp_overflow_count = 0
+
     # Training loop.
     for epoch in range(start_epoch, start_epoch + args.epochs):
         model.train()
         train_loss = 0.0
+        train_bce = 0.0
+        train_dice = 0.0
+        epoch_amp_overflows = 0
         # training batches
         for batch_index, (xb, yb) in enumerate(train_loader):
+            validate_batch(xb, yb, epoch + 1, batch_index)
             xb = xb.to(device)
             yb = yb.to(device)
             optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=torch.cuda.is_available()):
+            with autocast(enabled=amp_enabled):
                 logits = model(xb)
                 ensure_finite(logits, 'model output', epoch + 1, batch_index)
-                loss = bce_dice_loss(logits, yb)
+            loss, bce_component, dice_component = bce_dice_loss(
+                logits, yb, pos_weight, return_components=True
+            )
             ensure_finite(loss, 'loss', epoch + 1, batch_index)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            ensure_finite(bce_component, 'BCE loss', epoch + 1, batch_index)
+            ensure_finite(dice_component, 'Dice loss', epoch + 1, batch_index)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+            else:
+                loss.backward()
+            loss_info = {
+                'loss': loss.detach().item(),
+                'bce': bce_component.item(),
+                'dice': dice_component.item(),
+                'logits_min': logits.detach().float().min().item(),
+                'logits_max': logits.detach().float().max().item(),
+                'prob_min': torch.sigmoid(logits.detach().float()).min().item(),
+                'prob_max': torch.sigmoid(logits.detach().float()).max().item(),
+                'target_min': yb.detach().float().min().item(),
+                'target_max': yb.detach().float().max().item(),
+                'target_positive_pixels': int((yb.detach() > 0.5).sum().item()),
+                'target_positive_fraction': (yb.detach() > 0.5).float().mean().item(),
+            }
+            if scaler is not None:
+                # AMP path: a transient non-finite gradient here is expected,
+                # self-correcting GradScaler behaviour (see
+                # check_finite_gradients_amp docstring). Report it, skip
+                # clipping for this batch, and let scaler.step()/update()
+                # skip the optimizer step and back off the scale factor.
+                grads_finite = check_finite_gradients_amp(model, epoch + 1, batch_index, loss_info)
+                if grads_finite:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                else:
+                    amp_overflow_count += 1
+                    epoch_amp_overflows += 1
+                    print(
+                        f'AMP overflow #{amp_overflow_count}: skipping optimizer step for '
+                        f'epoch {epoch + 1}, batch {batch_index}; GradScaler will shrink '
+                        'its scale factor automatically.'
+                    )
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # No-amp / true fp32 path: there is no loss scaling, so a
+                # non-finite gradient here reflects genuine numerical
+                # instability, not an AMP artifact. Fail fast as before.
+                ensure_finite_gradients(model, epoch + 1, batch_index, loss_info)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            ensure_finite_parameters(model, epoch + 1, batch_index)
             train_loss += loss.detach().item()
+            train_bce += bce_component.item()
+            train_dice += dice_component.item()
 
         model.eval()
         val_loss = 0.0
         val_metrics = {'iou':0.0, 'dice':0.0, 'precision':0.0, 'recall':0.0}
+        threshold_values = (0.30, 0.40, 0.50, 0.60, 0.70)
+        threshold_ious = {threshold: 0.0 for threshold in threshold_values}
         with torch.no_grad():
             for batch_index, (xb, yb) in enumerate(val_loader):
+                validate_batch(xb, yb, epoch + 1, batch_index)
                 xb = xb.to(device)
                 yb = yb.to(device)
-                with autocast(enabled=torch.cuda.is_available()):
+                with autocast(enabled=amp_enabled):
                     logits = model(xb)
                     ensure_finite(logits, 'model output', epoch + 1, batch_index)
-                    loss = bce_dice_loss(logits, yb)
+                loss = bce_dice_loss(logits, yb, pos_weight)
                 ensure_finite(loss, 'loss', epoch + 1, batch_index)
                 val_loss += loss.detach().item()
                 # metric computation in batch and accumulate.
                 # convert CPU to compute where necessary
                 probs = torch.sigmoid(logits.float())
-                a, b, c, d = compute_metrics(probs.detach().cpu(), yb.detach().cpu())
+                probs_cpu = probs.detach().cpu()
+                target_cpu = yb.detach().cpu()
+                a, b, c, d = compute_metrics(probs_cpu, target_cpu)
                 val_metrics['iou'] += a
                 val_metrics['dice'] += b
                 val_metrics['precision'] += c
                 val_metrics['recall'] += d
+                pred_pct, target_pct = pixel_percentages(probs_cpu, target_cpu)
+                val_metrics.setdefault('predicted_building_pct', 0.0)
+                val_metrics.setdefault('actual_building_pct', 0.0)
+                val_metrics['predicted_building_pct'] += pred_pct
+                val_metrics['actual_building_pct'] += target_pct
+                for threshold in threshold_values:
+                    threshold_ious[threshold] += compute_metrics(
+                        probs_cpu, target_cpu, threshold=threshold
+                    )[0]
 
         # Save metrics.
         n_batches = max(1, len(val_loader))
         metrics = {
             'epoch': epoch + 1,
             'train_loss': train_loss / len(train_loader),
+            'train_bce': train_bce / len(train_loader),
+            'train_dice': train_dice / len(train_loader),
             'val_loss': val_loss / n_batches,
             'val_iou': val_metrics['iou'] / n_batches,
             'val_dice': val_metrics['dice'] / n_batches,
             'val_precision': val_metrics['precision'] / n_batches,
             'val_recall': val_metrics['recall'] / n_batches,
+            'predicted_building_pct': val_metrics.get('predicted_building_pct', 0.0) / n_batches,
+            'actual_building_pct': val_metrics.get('actual_building_pct', 0.0) / n_batches,
+            'threshold_iou': {
+                f'{threshold:.2f}': value / n_batches
+                for threshold, value in threshold_ious.items()
+            },
         }
         history['train_loss'].append(metrics['train_loss'])
         history['val_loss'].append(metrics['val_loss'])
@@ -741,14 +1055,20 @@ def run_training(args):
             'epoch': epoch + 1,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'scaler_state': scaler.state_dict(),
             'best_iou': best_iou,
+            'model_type': current_model_tag,
         }
+        if scaler is not None:
+            state['scaler_state'] = scaler.state_dict()
         torch.save(state, latest_path)
 
-        print(f'epoch={epoch+1} train_loss={metrics["train_loss"]:.4f} val_loss={metrics["val_loss"]:.4f} ' +
-              f'val_iou={metrics["val_iou"]:.4f} val_dice={metrics["val_dice"]:.4f} ' +
-              f'val_precision={metrics["val_precision"]:.4f} val_recall={metrics["val_recall"]:.4f}')
+        print('epoch={} train_loss={:.4f} bce={:.4f} dice={:.4f} val_loss={:.4f} val_iou={:.4f} val_dice={:.4f} val_precision={:.4f} val_recall={:.4f} pred_building={:.2f}% actual_building={:.2f}%'.format(epoch + 1, metrics['train_loss'], metrics['train_bce'], metrics['train_dice'], metrics['val_loss'], metrics['val_iou'], metrics['val_dice'], metrics['val_precision'], metrics['val_recall'], metrics['predicted_building_pct'], metrics['actual_building_pct']))
+        print('Validation threshold sweep:')
+        for threshold, iou in metrics['threshold_iou'].items():
+            print(f'  {threshold} -> IoU {iou:.4f}')
+        if scaler is not None:
+            print(f'AMP overflow batches this epoch: {epoch_amp_overflows} / {len(train_loader)} '
+                  f'(current scale factor: {scaler.get_scale():.1f})')
 
         # Optional early stopping on plateau.
         if epoch >= 3 and args.early_stop_window:
@@ -770,7 +1090,8 @@ def run_training(args):
     }, metrics_path)
 
     # Test evaluation using best checkpoint state.
-    test_metrics = evaluate_best_on_test(best_path, test_loader, device)
+    test_metrics = evaluate_best_on_test(args, best_path, test_loader, device, pos_weight, amp_enabled)
+    test_metrics['model_type'] = 'scratch_unet' if args.scratch_unet else f'smp_unet_{args.encoder}'
     print('Test metrics:', json.dumps(test_metrics, indent=2))
     # save test metrics as JSON
     save_metrics(test_metrics, LOG_DIR / 'test_metrics.json')
@@ -779,12 +1100,12 @@ def run_training(args):
     print(f'latest checkpoint = {latest_path}')
 
 
-def evaluate_best_on_test(best_path, test_loader, device):
-    model = UNet().to(device)
+def evaluate_best_on_test(args, best_path, test_loader, device, pos_weight=None, amp_enabled=True):
+    model = build_model(args).to(device)
     model.load_state_dict(torch.load(best_path, map_location=device))
     model.eval()
     # run test metrics
-    return validate_model(model, test_loader, device)
+    return validate_model(model, test_loader, device, pos_weight, amp_enabled)
 
 
 def main():
@@ -803,10 +1124,21 @@ def main():
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--patch-size', type=int, default=512)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--scratch-unet', action='store_true',
+                         help='Use the original from-scratch UNet (32/64/128/256 channels, no '
+                              'pretrained weights) instead of an ImageNet-pretrained encoder. '
+                              'Use this to A/B against the pretrained-encoder default.')
+    parser.add_argument('--encoder', default='resnet34',
+                         help='Encoder backbone for the pretrained U-Net (segmentation-models-pytorch '
+                              'name, e.g. resnet34, resnet50, efficientnet-b0). Ignored with --scratch-unet.')
+    parser.add_argument('--encoder-weights', default='imagenet',
+                         help="Pretrained weights for the encoder, e.g. 'imagenet' or 'none' for "
+                              'random init with the same architecture. Ignored with --scratch-unet.')
     parser.add_argument('--sanity-check', action='store_true')
     parser.add_argument('--sanity-only', action='store_true')
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--no-amp', action='store_true', help='Disable CUDA AMP for numerical-stability testing.')
     parser.add_argument('--early-stop-window', type=int, default=5)
     args = parser.parse_args()
 
@@ -818,7 +1150,7 @@ def main():
         raise FileNotFoundError('Expected Dataset/Annotations_final and Dataset/masks_cleaned directories. Run geometry repair/regenerate mask generation first.')
 
     # Generate final masks from final annotations and build patches.
-    regenerate_final_masks_from_annotations()
+    regenerate_final_masks_from_annotations(ANNOT_DIR, MASK_DIR)
     generate_patches(patch_size=args.patch_size, stride=args.patch_size, overlap=False)
 
     # Make the requested run portable and non-video-dependent.
