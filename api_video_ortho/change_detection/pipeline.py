@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from maskrcnn_pipeline.model import build_model, load_checkpoint
+from ..maskrcnn_pipeline.model import build_model, load_checkpoint
 
 from .change_classifier import classify_changes
 from .inference import detect_instances
@@ -72,10 +72,10 @@ def run_pair(pair, root, args):
     (output_dir / "matches.json").write_text(json.dumps(matching, indent=2), encoding="utf-8")
     (output_dir / "changes.json").write_text(json.dumps(changes, indent=2), encoding="utf-8")
     with __import__("rasterio").open(before_path) as source:
-        from maskrcnn_pipeline.utils import read_window
+        from ..maskrcnn_pipeline.utils import read_window
         before_image = read_window(source, 0, 0, source.width, source.height)
     with __import__("rasterio").open(after_path) as source:
-        from maskrcnn_pipeline.utils import read_window
+        from ..maskrcnn_pipeline.utils import read_window
         after_image = read_window(source, 0, 0, source.width, source.height)
     save_detection_visualization(before_image, before, output_dir / "before_detections.png")
     save_detection_visualization(after_image, after, output_dir / "after_detections.png")

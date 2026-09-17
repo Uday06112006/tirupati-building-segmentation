@@ -7,8 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from maskrcnn_pipeline.inference import suppress_duplicates
-from maskrcnn_pipeline.utils import iter_tiles, read_window
+from ..maskrcnn_pipeline.utils import iter_tiles, read_window
 
 
 def _box_iou(first, second):
