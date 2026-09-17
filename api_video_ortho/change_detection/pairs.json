@@ -1,0 +1,37 @@
+[
+  {
+    "id": "F1",
+    "before": "DJI_0513_2sec_orthophoto.tif",
+    "after": "DJI_0529_2sec_orthophoto.tif"
+  },
+  {
+    "id": "F2",
+    "before": "DJI_0510_2sec_orthophoto.tif",
+    "after": "DJI_0530_2sec_orthophoto.tif"
+  },
+  {
+    "id": "F3",
+    "before": "DJI_0517_2sec_orthophoto.tif",
+    "after": "DJI_0531_2sec_orthophoto.tif"
+  },
+  {
+    "id": "F4",
+    "before": "DJI_0520_2sec_orthophoto.tif",
+    "after": "DJI_0532_2sec_orthophoto.tif"
+  },
+  {
+    "id": "F5",
+    "before": "DJI_0522_2sec_orthophoto.tif",
+    "after": "DJI_0533_2sec_orthophoto.tif"
+  },
+  {
+    "id": "F6",
+    "before": "DJI_0523_2sec_orthophoto.tif",
+    "after": "DJI_0534_2sec_orthophoto.tif"
+  },
+  {
+    "id": "F7",
+    "before": "DJI_0527_2sec_orthophoto.tif",
+    "after": "DJI_0535_2sec_orthophoto.tif"
+  }
+]
