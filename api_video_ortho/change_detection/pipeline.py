@@ -41,8 +41,8 @@ def save_detections(payload, output_dir):
 
 
 def run_pair(pair, root, args):
-    before_path = resolve_path(Path("outputs") / pair["before"], root)
-    after_path = resolve_path(Path("outputs") / pair["after"], root)
+    before_path = resolve_path(Path("Dataset/Orthophotos") / pair["before"], root)
+    after_path = resolve_path(Path("Dataset/Orthophotos") / pair["after"], root)
     for path in (before_path, after_path):
         if not path.exists():
             raise FileNotFoundError(f"Missing pair input: {path}")

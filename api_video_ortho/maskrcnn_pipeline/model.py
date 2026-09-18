@@ -20,10 +20,21 @@ def build_model(num_classes=2, pretrained=True):
 
 
 def load_checkpoint(model, checkpoint, device, optimizer=None, scheduler=None):
-    state = torch.load(checkpoint, map_location=device)
+    state = torch.load(checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(state.get("model", state))
+
     if optimizer is not None and state.get("optimizer"):
-        optimizer.load_state_dict(state["optimizer"])
+        try:
+            optimizer.load_state_dict(state["optimizer"])
+        except ValueError as e:
+            print(f"Warning: could not restore optimizer state: {e}")
+            print("Continuing with a fresh optimizer.")
+
     if scheduler is not None and state.get("scheduler"):
-        scheduler.load_state_dict(state["scheduler"])
+        try:
+            scheduler.load_state_dict(state["scheduler"])
+        except ValueError as e:
+            print(f"Warning: could not restore scheduler state: {e}")
+            print("Continuing with a fresh scheduler.")
+
     return state

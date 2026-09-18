@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+from rasterio.enums import Resampling
 
 
 def raster_info(path: Path):
@@ -26,7 +27,7 @@ def read_preview(path: Path, max_size=1800):
         scale = min(1.0, max_size / max(source.width, source.height))
         image = source.read(
             out_shape=(min(3, source.count), max(1, int(source.height * scale)), max(1, int(source.width * scale))),
-            resampling=1,
+            resampling=Resampling.bilinear,
         )
     image = np.transpose(image, (1, 2, 0))
     if image.shape[2] == 1:
@@ -101,3 +102,5 @@ def register_images(before_path: Path, after_path: Path, method="auto"):
         "after_preview": after,
         "quality_ok": bool(inlier_ratio >= 0.15),
     }
+
+
